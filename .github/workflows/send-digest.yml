@@ -1,0 +1,86 @@
+name: Send Digest to Telegram
+
+on:
+  push:
+    paths:
+      - 'digests/*.md'
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find latest digest
+        id: digest
+        run: |
+          FILE=$(ls -t digests/*.md | head -1)
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+
+      - name: Send to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, urllib.request, re, sys
+
+          bot_token = os.environ['BOT_TOKEN']
+          chat_id = os.environ['CHAT_ID']
+          digest_file = "${{ steps.digest.outputs.file }}"
+
+          with open(digest_file, 'r') as f:
+              content = f.read()
+
+          # Convert markdown to Telegram HTML
+          # Bold: **text** or __text__ -> <b>text</b>
+          text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', content)
+          text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+          # Italic: *text* -> <i>text</i>
+          text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+          # Links: [text](url) -> <a href="url">text</a>
+          text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
+          # Headers: # text -> <b>text</b>
+          text = re.sub(r'^#{1,3}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+          # Strip remaining markdown artifacts
+          text = text.strip()
+
+          url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+
+          # Split into chunks of 4000 chars
+          chunks = []
+          while text:
+              if len(text) <= 4000:
+                  chunks.append(text)
+                  break
+              # Find last newline before 4000
+              idx = text.rfind('\n', 0, 4000)
+              if idx == -1:
+                  idx = 4000
+              chunks.append(text[:idx])
+              text = text[idx:].lstrip('\n')
+
+          for i, chunk in enumerate(chunks):
+              data = json.dumps({
+                  'chat_id': int(chat_id),
+                  'parse_mode': 'HTML',
+                  'text': chunk,
+                  'disable_web_page_preview': True
+              }).encode('utf-8')
+              req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+              try:
+                  resp = urllib.request.urlopen(req)
+                  result = json.loads(resp.read())
+                  print(f"Chunk {i+1}/{len(chunks)}: ok={result.get('ok')}")
+              except Exception as e:
+                  print(f"Chunk {i+1} failed: {e}", file=sys.stderr)
+                  # Try without HTML parse mode as fallback
+                  data = json.dumps({
+                      'chat_id': int(chat_id),
+                      'text': chunk,
+                      'disable_web_page_preview': True
+                  }).encode('utf-8')
+                  req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                  resp = urllib.request.urlopen(req)
+                  print(f"Chunk {i+1} sent as plain text")
+          PYEOF
