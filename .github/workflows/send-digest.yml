@@ -11,11 +11,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Find latest digest
+      - name: Find the digest file that was just committed
         id: digest
         run: |
-          FILE=$(ls -t digests/*.md | head -1)
+          FILE=$(git diff --name-only HEAD~1 HEAD -- 'digests/*.md' | head -1)
+          if [ -z "$FILE" ]; then
+            FILE=$(ls digests/*.md | sort -r | head -1)
+          fi
           echo "file=$FILE" >> $GITHUB_OUTPUT
+          echo "Sending: $FILE"
 
       - name: Send to Telegram
         env:
