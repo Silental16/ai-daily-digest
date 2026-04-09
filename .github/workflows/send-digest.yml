@@ -10,16 +10,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-      - name: Find the digest file that was just committed
+      - name: Find committed digest files
         id: digest
         run: |
-          FILE=$(git diff --name-only HEAD~1 HEAD -- 'digests/*.md' | head -1)
-          if [ -z "$FILE" ]; then
-            FILE=$(ls digests/*.md | sort -r | head -1)
-          fi
-          echo "file=$FILE" >> $GITHUB_OUTPUT
-          echo "Sending: $FILE"
+          # Get all .md files from this commit
+          FILES=$(git diff --name-only HEAD~1 HEAD -- 'digests/*.md' || echo "")
+          # Separate main digest and story
+          MAIN=$(echo "$FILES" | grep -v '\-story\.md$' | head -1)
+          STORY=$(echo "$FILES" | grep '\-story\.md$' | head -1)
+          echo "main=$MAIN" >> $GITHUB_OUTPUT
+          echo "story=$STORY" >> $GITHUB_OUTPUT
+          echo "Main: $MAIN"
+          echo "Story: $STORY"
 
       - name: Send to Telegram
         env:
@@ -27,64 +32,70 @@ jobs:
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python3 << 'PYEOF'
-          import os, json, urllib.request, re, sys
+          import os, json, urllib.request, re, sys, time
 
           bot_token = os.environ['BOT_TOKEN']
           chat_id = os.environ['CHAT_ID']
-          digest_file = "${{ steps.digest.outputs.file }}"
+          main_file = "${{ steps.digest.outputs.main }}"
+          story_file = "${{ steps.digest.outputs.story }}"
 
-          with open(digest_file, 'r') as f:
-              content = f.read()
+          def md_to_tg_html(content):
+              text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', content)
+              text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+              text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
+              text = re.sub(r'^#{1,3}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+              return text.strip()
 
-          # Convert markdown to Telegram HTML
-          # Bold: **text** or __text__ -> <b>text</b>
-          text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', content)
-          text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
-          # Italic: *text* -> <i>text</i>
-          text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
-          # Links: [text](url) -> <a href="url">text</a>
-          text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
-          # Headers: # text -> <b>text</b>
-          text = re.sub(r'^#{1,3}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
-          # Strip remaining markdown artifacts
-          text = text.strip()
+          def send_message(text):
+              url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+              chunks = []
+              while text:
+                  if len(text) <= 4000:
+                      chunks.append(text)
+                      break
+                  idx = text.rfind('\n', 0, 4000)
+                  if idx == -1:
+                      idx = 4000
+                  chunks.append(text[:idx])
+                  text = text[idx:].lstrip('\n')
 
-          url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
-
-          # Split into chunks of 4000 chars
-          chunks = []
-          while text:
-              if len(text) <= 4000:
-                  chunks.append(text)
-                  break
-              # Find last newline before 4000
-              idx = text.rfind('\n', 0, 4000)
-              if idx == -1:
-                  idx = 4000
-              chunks.append(text[:idx])
-              text = text[idx:].lstrip('\n')
-
-          for i, chunk in enumerate(chunks):
-              data = json.dumps({
-                  'chat_id': int(chat_id),
-                  'parse_mode': 'HTML',
-                  'text': chunk,
-                  'disable_web_page_preview': True
-              }).encode('utf-8')
-              req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-              try:
-                  resp = urllib.request.urlopen(req)
-                  result = json.loads(resp.read())
-                  print(f"Chunk {i+1}/{len(chunks)}: ok={result.get('ok')}")
-              except Exception as e:
-                  print(f"Chunk {i+1} failed: {e}", file=sys.stderr)
-                  # Try without HTML parse mode as fallback
+              for i, chunk in enumerate(chunks):
                   data = json.dumps({
                       'chat_id': int(chat_id),
+                      'parse_mode': 'HTML',
                       'text': chunk,
                       'disable_web_page_preview': True
                   }).encode('utf-8')
                   req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-                  resp = urllib.request.urlopen(req)
-                  print(f"Chunk {i+1} sent as plain text")
+                  try:
+                      resp = urllib.request.urlopen(req)
+                      result = json.loads(resp.read())
+                      print(f"Chunk {i+1}/{len(chunks)}: ok={result.get('ok')}")
+                  except Exception as e:
+                      print(f"Chunk {i+1} failed: {e}", file=sys.stderr)
+                      data = json.dumps({
+                          'chat_id': int(chat_id),
+                          'text': chunk,
+                          'disable_web_page_preview': True
+                      }).encode('utf-8')
+                      req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                      resp = urllib.request.urlopen(req)
+                      print(f"Chunk {i+1} sent as plain text")
+
+          # Send main digest
+          if main_file and os.path.exists(main_file):
+              print(f"Sending main digest: {main_file}")
+              with open(main_file, 'r') as f:
+                  send_message(md_to_tg_html(f.read()))
+          else:
+              print("No main digest file found")
+
+          # Send indie story as separate message (with a small delay)
+          if story_file and os.path.exists(story_file):
+              time.sleep(2)
+              print(f"Sending indie story: {story_file}")
+              with open(story_file, 'r') as f:
+                  send_message(md_to_tg_html(f.read()))
+          else:
+              print("No indie story file (skipping)")
           PYEOF
